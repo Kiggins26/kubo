@@ -52,6 +52,20 @@ type HttpApi struct {
 	version     *semver.Version
 }
 
+// Addr is an implementation of net.Addr for WebSocket.
+type Addr struct {
+	*url.URL
+}
+
+type parsedWebsocketMultiaddr struct {
+	isWSS bool
+	// sni is the SNI value for the TLS handshake, and for setting HTTP Host header
+	sni *ma.Component
+	// the rest of the multiaddr before the /tls/sni/example.com/ws or /ws or /wss
+	restMultiaddr ma.Multiaddr
+}
+
+
 // NewLocalApi tries to construct new HttpApi instance communicating with local
 // IPFS daemon
 //
@@ -77,6 +91,77 @@ func NewPathApi(ipfspath string) (*HttpApi, error) {
 		return nil, err
 	}
 	return NewApi(a)
+}
+
+func ConvertWebsocketMultiaddrToNetAddr(maddr ma.Multiaddr) (net.Addr, error) {
+	url, err := parseMultiaddr(maddr)
+	if err != nil {
+		return nil, err
+	}
+	return &Addr{URL: url}, nil
+}
+
+func parseWebsocketMultiaddr(a ma.Multiaddr) (parsedWebsocketMultiaddr, error) {
+	out := parsedWebsocketMultiaddr{}
+	// First check if we have a WSS component. If so we'll canonicalize it into a /tls/ws
+	withoutWss := a.Decapsulate(wssComponent)
+	if !withoutWss.Equal(a) {
+		a = withoutWss.Encapsulate(tlsWsComponent)
+	}
+
+	// Remove the ws component
+	withoutWs := a.Decapsulate(wsComponent)
+	if withoutWs.Equal(a) {
+		return out, fmt.Errorf("not a websocket multiaddr")
+	}
+
+	rest := withoutWs
+	// If this is not a wss then withoutWs is the rest of the multiaddr
+	out.restMultiaddr = withoutWs
+	for {
+		var head *ma.Component
+		rest, head = ma.SplitLast(rest)
+		if head == nil || rest == nil {
+			break
+		}
+
+		if head.Protocol().Code == ma.P_SNI {
+			out.sni = head
+		} else if head.Protocol().Code == ma.P_TLS {
+			out.isWSS = true
+			out.restMultiaddr = rest
+			break
+		}
+	}
+
+	return out, nil
+}
+
+//parseMultiaddreToUrl
+func parseMultiaddrToUrl(maddr ma.Multiaddr) (*url.URL, error) {
+	parsed, err := parseWebsocketMultiaddr(maddr)
+	if err != nil {
+		return nil, err
+	}
+
+	scheme := "ws"
+	if parsed.isWSS {
+		scheme = "wss"
+	}
+
+	network, host, err := manet.DialArgs(parsed.restMultiaddr)
+	if err != nil {
+		return nil, err
+	}
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+	default:
+		return nil, fmt.Errorf("unsupported websocket network %s", network)
+	}
+	return &url.URL{
+		Scheme: scheme,
+		Host:   host,
+	}, nil
 }
 
 // ApiAddr reads api file in specified ipfs path.
@@ -110,7 +195,7 @@ func NewApi(a ma.Multiaddr) (*HttpApi, error) {
 
 // NewApiWithClient constructs HttpApi with specified endpoint and custom http client.
 func NewApiWithClient(a ma.Multiaddr, c *http.Client) (*HttpApi, error) {
-	_, url, err := manet.DialArgs(a)
+	_, url, err := manet.DialArgs(a) //change to http web call
 	if err != nil {
 		return nil, err
 	}
